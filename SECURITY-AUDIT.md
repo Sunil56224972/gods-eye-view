@@ -76,12 +76,45 @@ Not the end of the world on its own, but it's a one-line fix in the Vite config.
 
 ---
 
+### 6. OpenAI token minting has no access control — LAN callers can drain your billing
+
+This is the counterpart to #1 that still works even after the DNS rebinding fix.
+
+The `/api/realtime/token` endpoint takes the server's secret `OPENAI_API_KEY`, sends it to OpenAI, and hands back a working ephemeral session token. The `/api/openai/hud-summary` endpoint does the same — each call costs tokens.
+
+The key-setup endpoints that *manage* credentials have 9 layers of defense: loopback socket check, local hostname check, proxy header rejection, sharing mode check, origin validation, content-type enforcement, rate limiting, externally-managed guard, and symlink protection. That's Fort Knox.
+
+But the endpoints that actually *spend* the key? Zero access control. Just an opt-in rate limiter (30/min default).
+
+With `HOST=0.0.0.0` (which the docs recommend for LAN sharing), any device on the network can:
+
+```bash
+# from any machine on the LAN
+curl http://192.168.1.100:4173/api/realtime/token
+# → 200 OK + working OpenAI session token
+
+curl -X POST http://192.168.1.100:4173/api/openai/hud-summary \
+  -H 'Content-Type: application/json' \
+  -d '{"place":"test","layers":[]}'
+# → 200 OK (each call costs tokens)
+```
+
+At the default 30 req/min rate limit, that's 43,200 token-minting requests per day. Each one creates a session that can make OpenAI API calls on the owner's account.
+
+The asymmetry is the bug: the door to the vault has 9 locks, but the ATM in the lobby has none.
+
+**Fix:** Added a loopback-only check (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) to both `realtime.js` and `hud-summary.js`. Non-loopback callers get 403 before the API key is even read. Same pattern the key-setup endpoints already use, just applied to the endpoints that actually cost money.
+
+---
+
 ## Changed files
 
 - `build/vite.js` — DNS rebinding fix + nosniff header
 - `server/providers/openai/debug-log.js` — timestamp forgery fix
 - `server/standalone/key-setup.js` — added rate limiting
 - `server/providers/common/rate-limit.js` — secure default for OpenAI throttle
+- `server/providers/openai/realtime.js` — loopback-only access control on token minting
+- `server/providers/openai/hud-summary.js` — loopback-only access control on HUD summary
 
 ## POC scripts
 
@@ -91,3 +124,4 @@ All in `security/poc/`:
 - `03-keyset-no-ratelimit.mjs` — floods the credential endpoint
 - `04-missing-nosniff.mjs` — scans endpoints for missing headers
 - `05-openai-cost-drain.mjs` — demonstrates unlimited OpenAI calls
+- `06-token-no-access-control.mjs` — proves LAN callers can mint tokens
