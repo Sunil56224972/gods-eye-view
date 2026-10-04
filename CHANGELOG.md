@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+- Hold the CCTV Street View fallback to the same bar as the other Google
+  endpoints. `/api/cctv/frame/:id` used to call Street View Static with the
+  server key for any camera id at whatever `lat`/`lon` the query named, with
+  no cross-site gate and no throttle, so any page open in the browser could
+  bill the key with `<img>` tags. The fallback now runs only for registered
+  cameras, keeps a client pose only within 1.5 km of the camera (calibration
+  range), refuses cross-site callers, applies `GEV_RATELIMIT_GOOGLE_PER_MIN`
+  (own bucket, default 120) and caches frames for 30 minutes. Refused
+  requests get the synthetic frame.
+
+- Keep the dev server from serving `.gev-logs/` and `.gev-cache/`. The
+  voice debug log (on by default) holds speech transcripts and tool results,
+  and `GET /.gev-logs/realtime-conversations.jsonl` returned it, readable by
+  any localhost page through Vite's localhost CORS. Both directories are now
+  in `server.fs.deny` and answer 403.
+
 ## [0.2.1] — 2026-10-02 — God's Eye View through Your Agent (with security fixes and other features)
 
 - Ship each bundled data pack once. The region, marine, admin-boundary,

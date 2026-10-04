@@ -19,7 +19,66 @@ import {
 import { sanitizeCctvRangeHeader } from './cctv/range.js';
 import { createHlsPuller } from './cctv/stream.js';
 import { googleServerApiKey } from './places/google-key.js';
+import { makeCostRateLimiter, clientKey } from './common/rate-limit.js';
+import { haversineKm } from './common/geo.js';
+import { admitSameSiteRequest } from '../../src/localRequestGate.mjs';
 export { CCTV_FRAME_FETCH_TIMEOUT_MS, fetchCctvImageFromUpstream };
+
+/**
+ * Requests/min/IP for billable Street View fallback fetches when
+ * GEV_RATELIMIT_GOOGLE_PER_MIN is unset: the same env var and default as the
+ * Places proxies, in its own bucket so polling camera cards cannot starve
+ * user-driven place search. Cache hits do not count.
+ */
+export const STREETVIEW_DEFAULT_PER_MIN = 120;
+
+/**
+ * How far a client-supplied pose may sit from the camera's registered position.
+ * The calibration panel moves a camera at most 900 m north and 900 m east
+ * (src/layers/cctv/calibration.js), about 1.27 km diagonally.
+ */
+export const STREETVIEW_MAX_POSE_OFFSET_KM = 1.5;
+
+/** Street View imagery is static, so a repeated pose reuses the fetched frame. */
+const STREETVIEW_CACHE_TTL_MS = 30 * 60_000;
+const STREETVIEW_CACHE_MAX_ENTRIES = 64;
+
+/**
+ * Resolve the Street View pose for a frame request. Only a registered camera
+ * gets one. A client lat/lon is honoured only near the registered position
+ * (calibration nudges) and is otherwise replaced by it; heading/fov/pitch are
+ * clamped by the fetch and cannot move the request elsewhere.
+ * @param {object|undefined} source - Registered camera, or undefined.
+ * @param {URLSearchParams} searchParams - Frame request query.
+ * @returns {{lat:number,lon:number,heading:number,fov:number,pitch:number}|null}
+ */
+export function resolveStreetViewPose(source, searchParams) {
+  const baseLat = toFiniteNumber(source?.lat);
+  const baseLon = toFiniteNumber(source?.lon);
+  if (!Number.isFinite(baseLat) || !Number.isFinite(baseLon)) return null;
+  const param = (name, fallback) => {
+    const raw = searchParams.get(name);
+    const value = raw === null || raw.trim() === '' ? NaN : Number(raw);
+    return Number.isFinite(value) ? value : Number(fallback);
+  };
+  let lat = param('lat', baseLat);
+  let lon = param('lon', baseLon);
+  if (
+    Math.abs(lat) > 90 ||
+    Math.abs(lon) > 180 ||
+    haversineKm(baseLat, baseLon, lat, lon) > STREETVIEW_MAX_POSE_OFFSET_KM
+  ) {
+    lat = baseLat;
+    lon = baseLon;
+  }
+  return {
+    lat,
+    lon,
+    heading: param('heading', source?.headingDeg),
+    fov: param('fov', source?.fovDeg),
+    pitch: param('pitch', source?.pitchDeg),
+  };
+}
 /**
  * Vite plugin: CCTV camera proxy with source registry, frame/media serving,
  * fallback chain (upstream -> Street View -> synthetic SVG), and health tracking.
@@ -43,6 +102,18 @@ export function cctvProxy({ sourceRoot = process.cwd() } = {}) {
   const HEALTH_MAX_ENTRIES = CCTV_MAX_SOURCES_CEILING;
   /** Live HLS strategies (see ./cctv/stream.js). Shared across dev and preview. */
   const puller = createHlsPuller();
+  // undefined = not built yet; null = the explicit 0 opt-out; fn = active limiter.
+  let streetViewLimiter;
+  const allowStreetViewSpend = (req) => {
+    if (streetViewLimiter === undefined)
+      streetViewLimiter = makeCostRateLimiter(
+        process.env.GEV_RATELIMIT_GOOGLE_PER_MIN,
+        STREETVIEW_DEFAULT_PER_MIN,
+      );
+    return !streetViewLimiter || streetViewLimiter(clientKey(req));
+  };
+  /** @type {Map<string,{at:number,frame:{ok:true,body:Buffer,contentType:string}}>} */
+  const streetViewCache = new Map();
 
   /** Update the health entry for a camera, evicting the oldest entry if at capacity. */
   const setHealth = (cameraId, patch) => {
@@ -87,8 +158,14 @@ export function cctvProxy({ sourceRoot = process.cwd() } = {}) {
    * (#33: a key scoped to Street View Static/Places, restricted by server IP
    * rather than HTTP referrer) and falls back to the browser-exposed
    * GOOGLE_MAPS_API_KEY for setups that haven't split the two yet.
+   *
+   * Every uncached call is billed to that key, so `allow` (the per-IP cost
+   * limiter) is consulted only on a cache miss, right before the fetch.
    */
-  const streetViewFallback = async ({ lat, lon, heading, fov, pitch }) => {
+  const streetViewFallback = async (
+    { lat, lon, heading, fov, pitch },
+    allow = () => true,
+  ) => {
     const streetViewKey = googleServerApiKey();
     if (!streetViewKey || !Number.isFinite(lat) || !Number.isFinite(lon))
       return null;
@@ -110,6 +187,14 @@ export function cctvProxy({ sourceRoot = process.cwd() } = {}) {
       );
       sv.searchParams.set('source', 'outdoor');
       sv.searchParams.set('return_error_code', 'true');
+      // Keyed before the API key is added. The 10 s card refresh repeats the
+      // same pose, so most refreshes are answered here at no cost.
+      const cacheKey = sv.search;
+      const cached = streetViewCache.get(cacheKey);
+      if (cached && Date.now() - cached.at < STREETVIEW_CACHE_TTL_MS)
+        return cached.frame;
+      streetViewCache.delete(cacheKey);
+      if (!allow()) return null;
       sv.searchParams.set('key', streetViewKey);
 
       const svResp = await fetch(sv.toString(), {
@@ -119,11 +204,15 @@ export function cctvProxy({ sourceRoot = process.cwd() } = {}) {
       const svType = svResp.headers.get('content-type') || '';
       if (!svResp.ok || !svType.startsWith('image/')) return null;
 
-      return {
+      const frame = {
         ok: true,
         body: Buffer.from(await svResp.arrayBuffer()),
         contentType: svType,
       };
+      if (streetViewCache.size >= STREETVIEW_CACHE_MAX_ENTRIES)
+        streetViewCache.delete(streetViewCache.keys().next().value);
+      streetViewCache.set(cacheKey, { at: Date.now(), frame });
+      return frame;
     } catch {
       return null;
     }
@@ -471,13 +560,6 @@ export function cctvProxy({ sourceRoot = process.cwd() } = {}) {
         const source = sourceById.get(cameraId);
         const label = url.searchParams.get('label') || source?.name || cameraId;
         const city = url.searchParams.get('city') || source?.city || '';
-        const lat = Number(url.searchParams.get('lat') || source?.lat);
-        const lon = Number(url.searchParams.get('lon') || source?.lon);
-        const heading = Number(
-          url.searchParams.get('heading') || source?.headingDeg,
-        );
-        const fov = Number(url.searchParams.get('fov') || source?.fovDeg);
-        const pitch = Number(url.searchParams.get('pitch') || source?.pitchDeg);
 
         // Only use server-registered upstream URLs — never accept client-supplied URLs
         // (prevents SSRF via ?upstream= query parameter)
@@ -507,13 +589,25 @@ export function cctvProxy({ sourceRoot = process.cwd() } = {}) {
           return;
         }
 
-        const sv = await streetViewFallback({
-          lat,
-          lon,
-          heading,
-          fov,
-          pitch,
-        });
+        // Street View is billed to the server key, so it meets the same bar as
+        // the Places proxies: a registered camera only (never an arbitrary id
+        // plus coordinates), a same-site caller (an <img> on another site
+        // carries Sec-Fetch-Site: cross-site), and the per-IP cost throttle.
+        // A refused request falls through to the synthetic frame below.
+        const streetViewPose = resolveStreetViewPose(source, url.searchParams);
+        const sameSite = admitSameSiteRequest({
+          hostHeader: req.headers?.host,
+          protocol: req.socket?.encrypted ? 'https:' : 'http:',
+          origin: req.headers?.origin,
+          secFetchSite: req.headers?.['sec-fetch-site'],
+          proxyHeaders: req.headers || {},
+        }).ok;
+        const sv =
+          streetViewPose && sameSite
+            ? await streetViewFallback(streetViewPose, () =>
+                allowStreetViewSpend(req),
+              )
+            : null;
         if (sv?.ok) {
           setHealth(cameraId, {
             status: 'degraded',
