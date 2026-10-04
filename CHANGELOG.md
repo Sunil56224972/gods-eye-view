@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+- Bound the terrain-heights proxy. `/api/terrain/heights` answered any
+  cross-site page (an `<img>` pointing at the local server was enough), and
+  each request of up to 2,000 never-seen points cost up to 32 upstream calls
+  to Re:Earth and 2,000 cache entries that were never evicted and were
+  re-serialized to `.gev-cache/terrain-heights.json` on every 15 s flush.
+  The route now refuses cross-site browser requests with the same gate as the
+  cost-bearing endpoints, rejects coordinates outside lon [-180, 180] /
+  lat [-90, 90] and over-long point lists with 400 instead of 500, and keeps
+  at most 50,000 points (least recently used evicted, including when an
+  older, larger cache file is loaded).
+
 ## [0.2.1] — 2026-10-02 — God's Eye View through Your Agent (with security fixes and other features)
 
 - Ship each bundled data pack once. The region, marine, admin-boundary,

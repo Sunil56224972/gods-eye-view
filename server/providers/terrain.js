@@ -8,6 +8,7 @@ import {
   terrainPointKey,
   validTerrainResult,
 } from '../../src/data/terrainHeightsProxy.js';
+import { admitSameSite } from './common/same-site.js';
 
 /**
  * Re:Earth terrain point-height proxy: batched lon/lat → ellipsoidal height
@@ -20,8 +21,15 @@ import {
  * Only missing/stale points go upstream; the response is rebuilt in exact
  * request order. Larger requests are chunked sequentially, and one failing
  * chunk does not discard the chunks that resolved.
+ *
+ * Every novel point a caller names costs an upstream lookup and a cache entry
+ * that the periodic flush re-serializes to disk, so the route refuses
+ * cross-site browser requests and the point cache is bounded.
+ * `options.maxCachePoints` overrides that bound so it is testable without
+ * minting fifty thousand coordinates.
+ * @param {{maxCachePoints?: number}} [options]
  */
-export function terrainHeightsProxy() {
+export function terrainHeightsProxy(options = {}) {
   const TTL_MS = 30 * 24 * 3600_000;
   const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
   const CACHE_PATH = path.join(CACHE_DIR, 'terrain-heights.json');
@@ -34,9 +42,46 @@ export function terrainHeightsProxy() {
   // that range.
   const UPSTREAM_CHUNK = 64;
   const MAX_POINTS = 2000;
+  // Live point ceiling for the cache (and so for the disk file it is flushed
+  // to). Terrain has a 30-day TTL and expired entries were never removed, so
+  // without a bound every distinct point ever asked for stayed resident and
+  // was re-written on every flush. Sized well above the client's own 20k
+  // ceiling (src/services/terrainHeights.js) so a real session never evicts.
+  const MAX_CACHE_POINTS =
+    Number.isFinite(options.maxCachePoints) && options.maxCachePoints > 0
+      ? Math.floor(options.maxCachePoints)
+      : 50_000;
 
   /** @type {Map<string, {at:number, result:object}>} keyed by canonical 5dp lon/lat. */
   const mem = new Map();
+  // The resolver reads and writes through this view so that Map insertion
+  // order is recency order: a hit or a write moves the point to the newest end.
+  const lruCache = {
+    get(key) {
+      const entry = mem.get(key);
+      if (entry !== undefined) {
+        mem.delete(key);
+        mem.set(key, entry);
+      }
+      return entry;
+    },
+    set(key, entry) {
+      mem.delete(key);
+      mem.set(key, entry);
+      return this;
+    },
+  };
+  /** Drop least recently used points past the ceiling. */
+  function trimCache() {
+    let evicted = false;
+    while (mem.size > MAX_CACHE_POINTS) {
+      const coldest = mem.keys().next().value;
+      if (coldest === undefined) break;
+      mem.delete(coldest);
+      evicted = true;
+    }
+    return evicted;
+  }
   /** @type {Map<string, Promise<Array<object>>>} single-flight per missing-point subset. */
   const inflight = new Map();
   let diskLoaded = false;
@@ -90,6 +135,8 @@ export function terrainHeightsProxy() {
     } catch {
       /* no disk cache yet */
     }
+    // A file written before the ceiling existed may hold far more points.
+    if (trimCache()) diskDirty = true;
     // Periodic flush, same shape as adsbdbProxy: coalesce writes instead of
     // hitting disk on every request.
     setInterval(async () => {
@@ -157,6 +204,10 @@ export function terrainHeightsProxy() {
 
   const installMiddleware = (server) => {
     server.middlewares.use('/api/terrain/heights', async (req, res) => {
+      // Refuse cross-site browser requests (an <img> or fetch from another
+      // site) before any cache or upstream work. Same-origin app requests and
+      // non-browser loopback callers (MCP panel_request) pass.
+      if (admitSameSite(req, res)) return;
       const send = (status, bodyObj) => {
         if (res.headersSent) return;
         res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -170,12 +221,12 @@ export function terrainHeightsProxy() {
         if (!points) {
           send(400, {
             error:
-              'invalid points parameter — expected "lon,lat;lon,lat;…" with finite numbers',
+              'invalid points parameter — expected "lon,lat;lon,lat;…" with lon in [-180, 180] and lat in [-90, 90]',
           });
           return;
         }
         if (points.length > MAX_POINTS) {
-          send(500, {
+          send(400, {
             error: `too many points (${points.length}); max ${MAX_POINTS} per request`,
           });
           return;
@@ -183,10 +234,13 @@ export function terrainHeightsProxy() {
 
         const outcome = await resolveTerrainHeightRequest({
           points,
-          cache: mem,
+          cache: lruCache,
           fetchMissing: fetchMissingSingleFlight,
           ttlMs: TTL_MS,
         });
+        // Trim after the response is assembled so a request never loses its
+        // own freshly fetched points.
+        trimCache();
         if (outcome.cacheChanged) diskDirty = true;
         if (outcome.upstreamError) {
           console.warn(

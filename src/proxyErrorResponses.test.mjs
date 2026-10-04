@@ -33,6 +33,7 @@ function fixture(name, overrides = {}, preview = false) {
     setInterval: () => ({ unref() {} }),
     LL2_CACHE_TTL_MS: 15 * 60_000,
     parseTerrainPoints: () => [[1, 2]],
+    admitSameSite: () => false,
     resolveTerrainHeightRequest: async () => { throw new Error(detail); },
     ...overrides,
   };

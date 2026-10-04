@@ -17,7 +17,10 @@ function defaultSleep(ms) {
 }
 
 /**
- * Parse the proxy's `points=lon,lat;...` query parameter.
+ * Parse the proxy's `points=lon,lat;...` query parameter. Coordinates must
+ * be real WGS84 positions: lon in [-180, 180], lat in [-90, 90]. Anything else
+ * is not a place the upstream can answer, and would only mint a fresh cache
+ * key and an upstream call per distinct value.
  * @param {string|null|undefined} raw
  * @returns {Array<[number, number]>|null}
  */
@@ -36,6 +39,7 @@ export function parseTerrainPoints(raw) {
     const lon = Number(parts[0]);
     const lat = Number(parts[1]);
     if (!Number.isFinite(lon) || !Number.isFinite(lat)) return null;
+    if (lon < -180 || lon > 180 || lat < -90 || lat > 90) return null;
     points.push([lon, lat]);
   }
   return points;

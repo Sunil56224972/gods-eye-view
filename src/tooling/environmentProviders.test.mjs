@@ -17,7 +17,7 @@ function install(plugin) {
     },
   });
   assert.equal(routes.size, 1);
-  return async (url = '/', method = 'GET') => {
+  return async (url = '/', method = 'GET', headers = {}) => {
     const res = {
       headersSent: false,
       writeHead(status, headers) {
@@ -26,8 +26,11 @@ function install(plugin) {
       end(body) {
         this.body = body;
       },
+      setHeader(name, value) {
+        this.headers = { ...this.headers, [name]: value };
+      },
     };
-    await [...routes.values()][0]({ url, method }, res);
+    await [...routes.values()][0]({ url, method, headers }, res);
     return res;
   };
 }
@@ -100,10 +103,125 @@ test('terrain middleware chunks missing points and reconstructs repeated/reorder
   assert.equal((await request('/?points=invalid')).status, 400);
   assert.equal(
     (await request('/?points=' + Array(2001).fill('0,1').join(';'))).status,
-    500,
+    400,
   );
   // Rejected requests add no upstream calls: still the five from the first batch.
   assert.equal(calls, 5);
+});
+
+test('terrain middleware refuses cross-site browser requests before any upstream or cache work', async (t) => {
+  isolate(t);
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return Response.json({ results: [{ ellipsoid: 1 }] });
+  });
+  const request = install(terrainHeightsProxy());
+  // An <img src> from another site carries no Origin, only Sec-Fetch-Site.
+  const img = await request('/?points=1,2', 'GET', {
+    host: 'localhost:5173',
+    'sec-fetch-site': 'cross-site',
+  });
+  assert.equal(img.statusCode, 403);
+  // A cross-site fetch carries the foreign Origin.
+  const foreign = await request('/?points=1,2', 'GET', {
+    host: 'localhost:5173',
+    origin: 'https://attacker.example',
+  });
+  assert.equal(foreign.statusCode, 403);
+  assert.equal(calls, 0);
+  // The app itself and non-browser loopback callers still resolve.
+  const sameOrigin = await request('/?points=1,2', 'GET', {
+    host: 'localhost:5173',
+    'sec-fetch-site': 'same-origin',
+  });
+  assert.equal(sameOrigin.status, 200);
+  assert.equal((await request('/?points=3,4')).status, 200);
+  assert.equal(calls, 2);
+});
+
+test('terrain middleware rejects coordinates outside WGS84 without an upstream call', async (t) => {
+  isolate(t);
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (raw) => {
+    calls++;
+    const points = new URL(raw).searchParams.get('points').split(';');
+    return Response.json({ results: points.map(() => ({ ellipsoid: 1 })) });
+  });
+  const request = install(terrainHeightsProxy());
+  for (const points of ['1e9,0', '0,1e9', '180.00001,0', '0,-90.00001'])
+    assert.equal((await request('/?points=' + points)).status, 400, points);
+  assert.equal(calls, 0);
+  assert.equal((await request('/?points=180,90;-180,-90')).status, 200);
+  assert.equal(calls, 1);
+});
+
+test('terrain point cache stays bounded, evicts least recently used, and flushes only the bound', async (t) => {
+  isolate(t);
+  const written = [];
+  t.mock.method(fsp, 'writeFile', async (_file, body) => written.push(body));
+  const timers = [];
+  t.mock.method(globalThis, 'setInterval', (fn) => {
+    timers.push(fn);
+    return { unref() {} };
+  });
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (raw) => {
+    calls++;
+    const points = new URL(raw).searchParams.get('points').split(';');
+    return Response.json({
+      results: points.map((p) => ({ ellipsoid: Number(p.split(',')[0]) })),
+    });
+  });
+  const request = install(terrainHeightsProxy({ maxCachePoints: 100 }));
+  // Ten requests of 64 novel points: 640 distinct points against a cap of 100.
+  for (let batch = 0; batch < 10; batch += 1) {
+    const points = Array.from(
+      { length: 64 },
+      (_, i) => `${(batch * 64 + i) / 1000},1`,
+    );
+    assert.equal((await request('/?points=' + points.join(';'))).status, 200);
+    // Keep the very first point hot: recency, not age, decides eviction.
+    assert.equal((await request('/?points=0,1')).status, 200);
+  }
+  assert.equal(calls, 10);
+  assert.equal(timers.length, 1);
+  await timers[0]();
+  const flushed = JSON.parse(written.at(-1)).points;
+  assert.equal(Object.keys(flushed).length, 100);
+  assert.ok(flushed['0.00000,1.00000'], 'recently used point survives');
+  assert.equal(flushed['0.00100,1.00000'], undefined, 'cold point evicted');
+  // The hot point is still served from cache; an evicted one goes upstream.
+  await request('/?points=0,1');
+  assert.equal(calls, 10);
+  await request('/?points=0.001,1');
+  assert.equal(calls, 11);
+});
+
+test('terrain point cache trims an oversized legacy disk file on load', async (t) => {
+  isolate(t);
+  const at = Date.now();
+  const points = {};
+  for (let i = 0; i < 50; i += 1)
+    points[`${i}.00000,1.00000`] = { at, result: { ellipsoid: i } };
+  t.mock.method(fsp, 'readFile', async () =>
+    JSON.stringify({ version: 2, points }),
+  );
+  const written = [];
+  t.mock.method(fsp, 'writeFile', async (_file, body) => written.push(body));
+  const timers = [];
+  t.mock.method(globalThis, 'setInterval', (fn) => {
+    timers.push(fn);
+    return { unref() {} };
+  });
+  t.mock.method(globalThis, 'fetch', async () => {
+    throw Error('unexpected upstream call');
+  });
+  const request = install(terrainHeightsProxy({ maxCachePoints: 10 }));
+  // The newest-written points survive and are served without upstream work.
+  assert.equal((await request('/?points=49,1')).status, 200);
+  await timers[0]();
+  assert.equal(Object.keys(JSON.parse(written.at(-1)).points).length, 10);
 });
 
 test('terrain middleware migrates valid legacy disk points without fabricating omitted heights', async (t) => {
