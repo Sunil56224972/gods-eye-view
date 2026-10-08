@@ -17,9 +17,16 @@ function install(plugin) {
     },
   });
   assert.equal(routes.size, 1);
-  return async (url = '/', method = 'GET') => {
+  return async (url = '/', method = 'GET', headers = {}) => {
     const res = {
       headersSent: false,
+      headers: {},
+      set statusCode(status) {
+        this.status = status;
+      },
+      setHeader(name, value) {
+        this.headers[name.toLowerCase()] = value;
+      },
       writeHead(status, headers) {
         Object.assign(this, { status, headers, headersSent: true });
       },
@@ -27,7 +34,7 @@ function install(plugin) {
         this.body = body;
       },
     };
-    await [...routes.values()][0]({ url, method }, res);
+    await [...routes.values()][0]({ url, method, headers, socket: {} }, res);
     return res;
   };
 }
@@ -164,6 +171,51 @@ test('traffic middleware preserves keyless mode, caching, stale budget fallback 
   assert.equal(
     (await request('/flow/8/1/1.pbf')).headers['x-tomtom-cache'],
     'MISS',
+  );
+  assert.equal(calls, 2);
+});
+
+test('traffic refuses cross-site requests before they spend the TomTom budget', async (t) => {
+  isolate(t, { TOMTOM_API_KEY: 'fixture-key', TOMTOM_DAILY_TILE_BUDGET: '3' });
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls++;
+    return new Response(new Uint8Array([1, 2, 3]));
+  });
+  const request = install(tomtomProxy());
+  const host = 'localhost:5173';
+  const refused = [
+    { host, 'sec-fetch-site': 'cross-site' }, // <img src> from any web page
+    { host, 'sec-fetch-site': 'same-site' },
+    { host, origin: 'https://evil.example' }, // fetch from another page
+    { host, origin: 'null' }, // sandboxed frame
+    { host, 'x-forwarded-for': '203.0.113.9' }, // through a proxy
+  ];
+  // Each refused shape asks for distinct uncached tiles: on main every one
+  // was a billed upstream attempt counted against the daily budget.
+  let x = 0;
+  for (const headers of refused)
+    for (let i = 0; i < 2; i++) {
+      const res = await request(`/flow/16/${x++}/0.pbf`, 'GET', headers);
+      assert.equal(res.status, 403, JSON.stringify(headers));
+    }
+  assert.equal((await request('/status', 'GET', refused[0])).status, 403);
+  assert.equal(calls, 0, 'TomTom is never asked');
+  const app = { host, 'sec-fetch-site': 'same-origin' };
+  assert.equal(json(await request('/status', 'GET', app)).dailyCount, 0);
+  // The app itself and loopback tools (no browser headers) still get tiles.
+  const tile = await request('/flow/8/1/1.pbf', 'GET', app);
+  assert.equal(tile.status, 200);
+  assert.equal(tile.headers['x-tomtom-cache'], 'MISS');
+  assert.equal((await request('/flow/8/2/1.pbf')).status, 200);
+  assert.equal(
+    (
+      await request('/flow/8/1/1.pbf', 'GET', {
+        host,
+        origin: `http://${host}`,
+      })
+    ).headers['x-tomtom-cache'],
+    'HIT',
   );
   assert.equal(calls, 2);
 });
