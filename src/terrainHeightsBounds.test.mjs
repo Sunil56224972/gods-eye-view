@@ -29,10 +29,18 @@ function install(plugin) {
   return routes;
 }
 
-function request(handler, { url = '/', remoteAddress = '127.0.0.1' } = {}) {
+function request(
+  handler,
+  { url = '/', remoteAddress = '127.0.0.1', reqHeaders = {} } = {},
+) {
   return new Promise((resolve, reject) => {
     const headers = new Map();
-    const req = { method: 'GET', url, headers: {}, socket: { remoteAddress } };
+    const req = {
+      method: 'GET',
+      url,
+      headers: reqHeaders,
+      socket: { remoteAddress },
+    };
     const res = {
       statusCode: 200,
       headersSent: false,
@@ -205,6 +213,40 @@ test('the route refuses a flood of requests from one client', async (t) => {
     }
   }
   assert.equal(refusedAt, 91, 'the 91st request in a minute is refused');
+});
+
+test('a cross-site page cannot fill the cache or spend the visitor quota', async (t) => {
+  const asked = stubTerrainUpstream(t);
+  const route = install(terrainHeightsProxy()).get('/api/terrain/heights');
+  const host = 'localhost:5173';
+  const refused = [
+    { host, 'sec-fetch-site': 'cross-site' }, // <img src> from any web page
+    { host, 'sec-fetch-site': 'same-site' },
+    { host, origin: 'https://evil.example' }, // fetch from another page
+    { host, origin: 'null' }, // sandboxed frame
+    { host, 'x-forwarded-for': '203.0.113.9' }, // through a proxy
+  ];
+  // More refused requests than the 90/min quota, each a distinct new key.
+  for (let i = 0; i < 100; i += 1) {
+    const reqHeaders = refused[i % refused.length];
+    const answer = await request(route, {
+      url: `/?points=${(-97 - i / 1000).toFixed(5)},30.26`,
+      reqHeaders,
+    });
+    assert.equal(answer.statusCode, 403, JSON.stringify(reqHeaders));
+  }
+  assert.deepEqual(asked, [], 'nothing reached upstream or the cache');
+
+  // The visitor's own app still has its full quota afterwards, and a
+  // loopback tool that sends no browser headers is admitted too.
+  const app = await request(route, {
+    url: '/?points=-97.74,30.26',
+    reqHeaders: { host, 'sec-fetch-site': 'same-origin' },
+  });
+  assert.equal(app.statusCode, 200);
+  const tool = await request(route, { url: '/?points=-97.75,30.26' });
+  assert.equal(tool.statusCode, 200);
+  assert.equal(asked.length, 2);
 });
 
 test('a second client keeps its own quota', async (t) => {

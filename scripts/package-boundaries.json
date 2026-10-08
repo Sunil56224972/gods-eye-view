@@ -113,7 +113,9 @@
       "server/providers/terrain.js",
       "src/data/terrainHeightsProxy.js",
       "server/providers/common/rate-limit.js",
-      "src/sources/rateLimit.js"
+      "src/sources/rateLimit.js",
+      "server/providers/common/same-site.js",
+      "src/localRequestGate.mjs"
     ],
     "external": []
   },
