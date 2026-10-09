@@ -1103,7 +1103,10 @@ plugin order, server-key selection, validation, disk caches, budgets, retries
 and stale/error responses remain unchanged. Each has a Node-only package entry
 under `gods-eye-view/server/providers/`. Portable terrain mechanics, traffic tile
 math and GBFS source rules are available under `gods-eye-view/sources/`.
-The browser layers and their rendering remain in their existing modules.
+The `/api/terrain/heights` route refuses cross-site browser requests before
+rate limiting, cache access or upstream work. Same-origin app requests and
+non-browser local callers remain supported in development and preview. The
+browser layers and their rendering remain in their existing modules.
 
 ## Terrain height cache bound
 

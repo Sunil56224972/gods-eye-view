@@ -79,6 +79,10 @@
   answer, since terrain does not move. Ordinary use is unaffected: a full
   `test:track` run drives 10 requests, peaking at 8/min.
 
+- `/api/terrain/heights` refuses cross-site browser requests before rate
+  limiting, cache access or upstream work. Same-origin app requests and
+  non-browser local callers remain supported.
+
 - Add an experimental ChatGPT/Codex OAuth option for cloud voice in Provider
   Settings. API-key voice remains the default. Local sign-in can start from
   the auth button and reports completion, failure, timeout, or expired
