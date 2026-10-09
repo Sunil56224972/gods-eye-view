@@ -7,9 +7,10 @@ import { firmsProxy } from 'gods-eye-view/server/providers/firms';
 import { gbfsProxy } from 'gods-eye-view/server/providers/gbfs';
 import { localProviderPlugins } from '../../server/providers/local.js';
 
-function install(plugin) {
+function install(plugin, hook = 'configureServer') {
   const routes = new Map();
-  plugin.configureServer({
+  assert.equal(typeof plugin[hook], 'function', `${hook} is available`);
+  plugin[hook]({
     middlewares: {
       use(route, handler) {
         routes.set(route, handler);
@@ -175,14 +176,13 @@ test('traffic middleware preserves keyless mode, caching, stale budget fallback 
   assert.equal(calls, 2);
 });
 
-test('traffic refuses cross-site requests before they spend the TomTom budget', async (t) => {
+test('traffic refuses cross-site requests in dev and preview before spending the TomTom budget', async (t) => {
   isolate(t, { TOMTOM_API_KEY: 'fixture-key', TOMTOM_DAILY_TILE_BUDGET: '3' });
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     calls++;
     return new Response(new Uint8Array([1, 2, 3]));
   });
-  const request = install(tomtomProxy());
   const host = 'localhost:5173';
   const refused = [
     { host, 'sec-fetch-site': 'cross-site' }, // <img src> from any web page
@@ -191,33 +191,47 @@ test('traffic refuses cross-site requests before they spend the TomTom budget', 
     { host, origin: 'null' }, // sandboxed frame
     { host, 'x-forwarded-for': '203.0.113.9' }, // through a proxy
   ];
-  // Each refused shape asks for distinct uncached tiles: on main every one
-  // was a billed upstream attempt counted against the daily budget.
-  let x = 0;
-  for (const headers of refused)
-    for (let i = 0; i < 2; i++) {
-      const res = await request(`/flow/16/${x++}/0.pbf`, 'GET', headers);
-      assert.equal(res.status, 403, JSON.stringify(headers));
-    }
-  assert.equal((await request('/status', 'GET', refused[0])).status, 403);
-  assert.equal(calls, 0, 'TomTom is never asked');
-  const app = { host, 'sec-fetch-site': 'same-origin' };
-  assert.equal(json(await request('/status', 'GET', app)).dailyCount, 0);
-  // The app itself and loopback tools (no browser headers) still get tiles.
-  const tile = await request('/flow/8/1/1.pbf', 'GET', app);
-  assert.equal(tile.status, 200);
-  assert.equal(tile.headers['x-tomtom-cache'], 'MISS');
-  assert.equal((await request('/flow/8/2/1.pbf')).status, 200);
-  assert.equal(
-    (
-      await request('/flow/8/1/1.pbf', 'GET', {
-        host,
-        origin: `http://${host}`,
-      })
-    ).headers['x-tomtom-cache'],
-    'HIT',
-  );
-  assert.equal(calls, 2);
+  for (const [mode, hook] of [
+    ['dev', 'configureServer'],
+    ['preview', 'configurePreviewServer'],
+  ]) {
+    const request = install(tomtomProxy(), hook);
+    // Each refused shape asks for distinct uncached tiles: without the gate
+    // every one would be a billed attempt counted against the daily budget.
+    let x = 0;
+    for (const headers of refused)
+      for (let i = 0; i < 2; i++) {
+        const res = await request(`/flow/16/${x++}/0.pbf`, 'GET', headers);
+        assert.equal(res.status, 403, `${mode}: ${JSON.stringify(headers)}`);
+      }
+    assert.equal(
+      (await request('/status', 'GET', refused[0])).status,
+      403,
+      `${mode}: status is gated too`,
+    );
+    assert.equal(
+      calls,
+      mode === 'dev' ? 0 : 2,
+      `${mode}: no refused upstream work`,
+    );
+    const app = { host, 'sec-fetch-site': 'same-origin' };
+    assert.equal(json(await request('/status', 'GET', app)).dailyCount, 0);
+    // The app itself and loopback tools (no browser headers) still get tiles.
+    const tile = await request('/flow/8/1/1.pbf', 'GET', app);
+    assert.equal(tile.status, 200);
+    assert.equal(tile.headers['x-tomtom-cache'], 'MISS');
+    assert.equal((await request('/flow/8/2/1.pbf')).status, 200);
+    assert.equal(
+      (
+        await request('/flow/8/1/1.pbf', 'GET', {
+          host,
+          origin: `http://${host}`,
+        })
+      ).headers['x-tomtom-cache'],
+      'HIT',
+    );
+    assert.equal(calls, mode === 'dev' ? 2 : 4);
+  }
 });
 
 test('FIRMS retains a large successful source during partial failure and filters stale data at serve time', async (t) => {
